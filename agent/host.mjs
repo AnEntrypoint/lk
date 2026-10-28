@@ -41,7 +41,10 @@ const CAPTURE_FRAME_MS = 10;            // small capture frames keep latency low
 const RNN_FRAME = CAPTURE_RATE * CAPTURE_FRAME_MS / 1000; // rnnoise runs on 10 ms at 48 kHz
 const DECIMATE = CAPTURE_RATE / STT_RATE;
 const VAD_THRESHOLD = Number(env.VAD_THRESHOLD ?? 0.6);
-const GATE_DBFS = Number(env.GATE_DBFS ?? -12);  // frames quieter than this never count as speech
+const GATE_DBFS = Number(env.GATE_DBFS ?? -16);  // frames quieter than this never count as speech
+const DRC_WINDOW_FRAMES = 60000 / CAPTURE_FRAME_MS; // 60 s moving window of 10 ms frames
+const DRC_TARGET_DBFS = Number(env.DRC_TARGET_DBFS ?? -20);
+const DRC_MAX_BOOST = Number(env.DRC_MAX_BOOST ?? 2); // linear gain ceiling: 2x = +6 dB
 const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 300) / CAPTURE_FRAME_MS;
 const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 6000) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
@@ -176,6 +179,32 @@ function denoiseFrame(state, pcm48) {
   return { vad, pcm16k };
 }
 
+// Moving-window leveler: tracks mean power over the last 60 s and boosts quiet input toward
+// DRC_TARGET_DBFS, capped at DRC_MAX_BOOST. Gain is smoothed so it does not pump.
+function makeLeveler() {
+  const power = new Float64Array(DRC_WINDOW_FRAMES);
+  let idx = 0;
+  let filled = 0;
+  let sum = 0;
+  let gain = 1;
+  const maxGain = DRC_MAX_BOOST;
+  return (pcm) => {
+    let p = 0;
+    for (let i = 0; i < pcm.length; i++) p += (pcm[i] / 32768) ** 2;
+    p /= pcm.length;
+    sum += p - power[idx];
+    power[idx] = p;
+    idx = (idx + 1) % DRC_WINDOW_FRAMES;
+    if (filled < DRC_WINDOW_FRAMES) filled++;
+    const meanDb = sum > 0 ? 10 * Math.log10(sum / filled) : -120;
+    const want = Math.min(maxGain, 10 ** ((DRC_TARGET_DBFS - meanDb) / 20));
+    gain += (Math.max(1, want) - gain) * 0.05;
+    const out = new Int16Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) out[i] = Math.max(-32768, Math.min(32767, Math.round(pcm[i] * gain)));
+    return out;
+  };
+}
+
 function frameDbfs(pcm16k) {
   let sum = 0;
   for (let i = 0; i < pcm16k.length; i++) sum += pcm16k[i] * pcm16k[i];
@@ -188,12 +217,14 @@ function frameDbfs(pcm16k) {
 async function listen(track, identity) {
   const stream = new AudioStream(track, { sampleRate: CAPTURE_RATE, numChannels: 1, frameSizeMs: CAPTURE_FRAME_MS });
   const state = rnn._rnnoise_create(0);
+  const level = makeLeveler();
   const preRoll = [];
   let utter = null;
   let silent = 0;
   for await (const frame of stream) {
     if (Date.now() < speakingUntil) { preRoll.length = 0; utter = null; continue; }
-    const { vad, pcm16k } = denoiseFrame(state, frame.data);
+    const { vad, pcm16k: denoised } = denoiseFrame(state, frame.data);
+    const pcm16k = level(denoised);
     const voiced = vad >= VAD_THRESHOLD && frameDbfs(pcm16k) >= GATE_DBFS;
     if (utter) {
       utter.push(pcm16k);
