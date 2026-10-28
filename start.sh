@@ -16,11 +16,13 @@ for pid in $(pgrep -f "ccm-inbox" 2>/dev/null); do
 done
 
 if ! up 8800; then
-  (cd "$ROOT" && setsid nohup bash run.sh > /tmp/run.log 2>&1 < /dev/null &)
+  cd "$ROOT" && setsid nohup bash run.sh > /tmp/run.log 2>&1 < /dev/null &
 fi
 if ! up 8801; then
-  (cd "$ROOT/agent" && setsid nohup node web-server.mjs > /tmp/web.log 2>&1 < /dev/null &)
+  cd "$ROOT/agent" && setsid nohup node web-server.mjs > /tmp/web.log 2>&1 < /dev/null &
 fi
+cd "$ROOT"
+echo "starting voice stack (first start can take a minute while models load)..."
 
 for _ in $(seq 1 60); do up 8800 && up 8801 && break; sleep 1; done
 up 8800 && up 8801 || { echo "voice stack did not come up; see /tmp/run.log" >&2; exit 1; }
