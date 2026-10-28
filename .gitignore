@@ -1,0 +1,11 @@
+models/
+native/vendor/
+native/build/
+native/bin/
+agent/node_modules/
+native/bin-cuda/
+native/bin-vulkan/
+native/livekit/
+livekit.log
+native/espeak/root/
+native/espeak/debs/

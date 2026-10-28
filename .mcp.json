@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ccm-inbox": {
+      "command": "npx",
+      "args": ["-y", "github:AnEntrypoint/ccm"],
+      "env": {
+        "CCM_PORT": "7777",
+        "CCM_WEBHOOK_URL": "http://127.0.0.1:8800/speak"
+      }
+    }
+  }
+}
