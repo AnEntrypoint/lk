@@ -43,7 +43,6 @@ const ENERGY_CONTINUE_DBFS = Number(env.ENERGY_CONTINUE_DBFS ?? -46); // hystere
 const BARGE_DBFS = Number(env.BARGE_DBFS ?? -30);              // raw level that counts as barge-in during playback
 const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
 const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
-const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 15000) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
 const MIN_UTTERANCE_FRAMES = 10;        // 100 ms
 const REPLY_TIMEOUT_MS = Number(env.REPLY_TIMEOUT_MS ?? 120000);
@@ -189,13 +188,42 @@ async function askBrain(text, from) {
 
 // Raw-path endpointing: no denoise, gain or gate stage. Each 10 ms frame is decimated to
 // 16 kHz for STT and classified by its own level. Hysteresis keeps dips inside a sentence.
-function decimateTo16k(pcm48) {
-  const out = new Int16Array(pcm48.length / DECIMATE);
-  for (let i = 0; i < out.length; i++) {
-    let sum = 0;
-    for (let k = 0; k < DECIMATE; k++) sum += pcm48[i * DECIMATE + k];
-    out[i] = Math.round(sum / DECIMATE);
+// Windowed-sinc low-pass (cutoff 7.2 kHz at 48 kHz, Hann window, 96 taps) so energy above
+// 8 kHz cannot fold back into the speech band when decimating by 3.
+const LP_TAPS = 96;
+const LP_TAPS_ARR = (() => {
+  const fc = 7200 / CAPTURE_RATE;
+  const taps = new Float64Array(LP_TAPS);
+  let sum = 0;
+  for (let n = 0; n < LP_TAPS; n++) {
+    const m = n - (LP_TAPS - 1) / 2;
+    const sinc = m === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * m) / (Math.PI * m);
+    taps[n] = sinc * (0.5 - 0.5 * Math.cos((2 * Math.PI * n) / (LP_TAPS - 1)));
+    sum += taps[n];
   }
+  for (let n = 0; n < LP_TAPS; n++) taps[n] /= sum;
+  return taps;
+})();
+function makeDecimator() {
+  const lpHistory = new Float64Array(LP_TAPS);
+  let lpPos = 0;
+  return (pcm48) => decimateWith(pcm48, lpHistory, () => lpPos, (v) => { lpPos = v; });
+}
+
+function decimateWith(pcm48, lpHistory, getPos, setPos) {
+  let lpPos = getPos();
+  const out = new Int16Array(pcm48.length / DECIMATE);
+  let o = 0;
+  for (let i = 0; i < pcm48.length; i++) {
+    lpHistory[lpPos] = pcm48[i];
+    if (i % DECIMATE === DECIMATE - 1) {
+      let acc = 0;
+      for (let k = 0; k < LP_TAPS; k++) acc += LP_TAPS_ARR[k] * lpHistory[(lpPos - k + LP_TAPS) % LP_TAPS];
+      out[o++] = Math.max(-32768, Math.min(32767, Math.round(acc)));
+    }
+    lpPos = (lpPos + 1) % LP_TAPS;
+  }
+  setPos(lpPos);
   return out;
 }
 
@@ -208,6 +236,7 @@ function rawDbfs(pcm48) {
 
 async function listen(track, identity) {
   const stream = new AudioStream(track, { sampleRate: CAPTURE_RATE, numChannels: 1, frameSizeMs: CAPTURE_FRAME_MS });
+  const decimateTo16k = makeDecimator();
   const preRoll = [];
   let utter = null;
   let silent = 0;
@@ -238,7 +267,7 @@ async function listen(track, identity) {
     if (utter) {
       utter.push(pcm16k);
       silent = db >= ENERGY_CONTINUE_DBFS ? 0 : silent + 1;
-      if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTER_FRAMES) {
+      if (silent >= END_SILENCE_FRAMES) {
         const done = utter;
         utter = null;
         if (done.length >= MIN_UTTERANCE_FRAMES) handleUtterance(done, identity);
