@@ -103,6 +103,9 @@ let playbackId = 0;
 const BARGE_VAD = Number(env.BARGE_VAD ?? 0.6);       // same as the speech-start threshold; BARGE_MS guards against blips
 const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
 let bargeCount = 0;
+let peakVad = 0;
+let peakDb = -Infinity;
+let lastBargeLog = 0;
 
 // Cancels whatever the bot is saying: drops queued audio and stops the speak loop.
 function interruptPlayback() {
@@ -262,6 +265,15 @@ async function listen(track, identity) {
     const loud = frameDbfs(pcm16k) >= GATE_DBFS;
     if (Date.now() < speakingUntil) {
       // Bot is talking: only sustained, confident speech counts as a barge-in.
+      const now = Date.now();
+      if (now - lastBargeLog >= 1000) {
+        console.log(`[${identity}] during playback: peakVad=${peakVad.toFixed(2)} peakDbfs=${peakDb.toFixed(1)}`);
+        peakVad = 0;
+        peakDb = -Infinity;
+        lastBargeLog = now;
+      }
+      peakVad = Math.max(peakVad, vad);
+      peakDb = Math.max(peakDb, frameDbfs(pcm16k));
       bargeCount = loud && vad >= BARGE_VAD ? bargeCount + 1 : 0;
       if (bargeCount < BARGE_FRAMES) {
         preRoll.push(pcm16k);
