@@ -22,6 +22,8 @@ LIVEKIT_URL=wss://... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... ./run.sh   # us
 
 Env for `agent/host.mjs`: `LK_ROOM` (default `lk-voice`), `LK_IDENTITY` (`voice-host`), `LLM_URL` (responder webhook: receives `{text, from}`, returns `{text}`; unset = echo), `PARADEE_URL`, `STT_URL`, `HTTP_PORT` (8800).
 
+Browser client: `node agent/web-server.mjs` then open http://127.0.0.1:8801. Join, allow the mic: the mic goes to the host (receiver), and the host's reply track plays in the page (responder).
+
 Endpoints on the host: `GET /health`, `POST /speak {text}`.
 
 ## Known limitations
