@@ -17,6 +17,7 @@ import {
   TrackPublishOptions,
   TrackSource,
 } from '@livekit/rtc-node';
+import createRNN from './vendor/rnnoise-sync.mjs';
 
 const env = process.env;
 const cfg = {
@@ -35,9 +36,15 @@ const cfg = {
 const TTS_RATE = 24000;
 const STT_RATE = 16000;
 const FRAME_MS = 20;
-const SILENCE_RMS = 500;   // int16 RMS below this counts as silence
-const SILENCE_FRAMES = 25; // 0.5 s of silence ends an utterance
-const MIN_UTTERANCE_FRAMES = 10;
+const CAPTURE_RATE = 48000;
+const CAPTURE_FRAME_MS = 10;            // small capture frames keep latency low
+const RNN_FRAME = CAPTURE_RATE * CAPTURE_FRAME_MS / 1000; // rnnoise runs on 10 ms at 48 kHz
+const DECIMATE = CAPTURE_RATE / STT_RATE;
+const VAD_THRESHOLD = Number(env.VAD_THRESHOLD ?? 0.6);
+const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 300) / CAPTURE_FRAME_MS;
+const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 6000) / CAPTURE_FRAME_MS;
+const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
+const MIN_UTTERANCE_FRAMES = 10;        // 100 ms
 const REPLY_TIMEOUT_MS = Number(env.REPLY_TIMEOUT_MS ?? 120000);
 
 function token() {
@@ -83,17 +90,23 @@ async function synthesize(text) {
 }
 
 let source;
+// Mic audio is ignored while the bot speaks and for ECHO_TAIL_MS after, so the
+// room's own playback picked up by a browser mic is not transcribed back.
+const ECHO_TAIL_MS = 800;
+let speakingUntil = 0;
 
 async function speak(text) {
   if (!source) throw new Error('not connected to a room yet');
   const { samples, rate } = await synthesize(text);
   if (rate !== TTS_RATE) throw new Error(`unexpected TTS rate ${rate}`);
   const per = (TTS_RATE * FRAME_MS) / 1000;
+  speakingUntil = Date.now() + (samples.length / TTS_RATE) * 1000 + ECHO_TAIL_MS;
   for (let i = 0; i < samples.length; i += per) {
     const chunk = samples.slice(i, i + per);
     const padded = chunk.length === per ? chunk : Object.assign(new Int16Array(per), chunk);
     await source.captureFrame(new AudioFrame(padded, TTS_RATE, 1, per));
   }
+  speakingUntil = Date.now() + ECHO_TAIL_MS;
 }
 
 async function transcribe(samples16k) {
@@ -141,33 +154,62 @@ async function askBrain(text, from) {
   return (await res.json()).text ?? '';
 }
 
-// Energy-gated segmentation of one remote track into utterances at 16 kHz.
-async function listen(track, identity) {
-  const stream = new AudioStream(track, { sampleRate: STT_RATE, numChannels: 1 });
-  let buf = [];
-  let quiet = 0;
-  let busy = false;
-  for await (const frame of stream) {
-    const data = frame.data;
+// rnnoise denoises each 10 ms frame at 48 kHz, returns its voice-activity probability,
+// and the output is decimated to 16 kHz for STT.
+const rnn = await createRNN();
+const rnnIn = rnn._malloc(RNN_FRAME * 4);
+const rnnOut = rnn._malloc(RNN_FRAME * 4);
+
+function denoiseFrame(state, pcm48) {
+  const base = rnnIn >> 2;
+  for (let i = 0; i < RNN_FRAME; i++) rnn.HEAPF32[base + i] = pcm48[i];
+  const vad = rnn._rnnoise_process_frame(state, rnnOut, rnnIn);
+  const outBase = rnnOut >> 2;
+  const pcm16k = new Int16Array(RNN_FRAME / DECIMATE);
+  for (let i = 0; i < pcm16k.length; i++) {
+    const j = outBase + i * DECIMATE;
     let sum = 0;
-    for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-    const rms = Math.sqrt(sum / data.length);
-    if (rms >= SILENCE_RMS) {
-      buf.push(new Int16Array(data));
-      quiet = 0;
-    } else if (buf.length) {
-      buf.push(new Int16Array(data));
-      quiet++;
-    }
-    if (buf.length && quiet >= SILENCE_FRAMES && !busy) {
-      const utter = buf;
-      buf = [];
-      quiet = 0;
-      if (utter.length < MIN_UTTERANCE_FRAMES) continue;
-      busy = true;
-      handleUtterance(utter, identity).finally(() => { busy = false; });
-    }
+    for (let k = 0; k < DECIMATE; k++) sum += rnn.HEAPF32[j + k];
+    pcm16k[i] = Math.max(-32768, Math.min(32767, Math.round(sum / DECIMATE)));
   }
+  return { vad, pcm16k };
+}
+
+// VAD-endpointed segmentation of one remote track. An utterance is sent as soon as
+// speech has been quiet for END_SILENCE_MS, or when it reaches MAX_UTTER_MS.
+async function listen(track, identity) {
+  const stream = new AudioStream(track, { sampleRate: CAPTURE_RATE, numChannels: 1, frameSizeMs: CAPTURE_FRAME_MS });
+  const state = rnn._rnnoise_create(0);
+  const preRoll = [];
+  let utter = null;
+  let silent = 0;
+  for await (const frame of stream) {
+    if (Date.now() < speakingUntil) { preRoll.length = 0; utter = null; continue; }
+    const { vad, pcm16k } = denoiseFrame(state, frame.data);
+    if (utter) {
+      utter.push(pcm16k);
+      silent = vad >= VAD_THRESHOLD ? 0 : silent + 1;
+      if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTER_FRAMES) {
+        const done = utter;
+        utter = null;
+        if (done.length >= MIN_UTTERANCE_FRAMES) handleUtterance(done, identity);
+      }
+    } else if (vad >= VAD_THRESHOLD) {
+      utter = [...preRoll, pcm16k];
+      silent = 0;
+    }
+    preRoll.push(pcm16k);
+    if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
+  }
+  rnn._rnnoise_destroy(state);
+}
+
+// Transcriptions run one at a time so utterances are served in order without blocking capture.
+let sttChain = Promise.resolve();
+function transcribeQueued(pcm) {
+  const job = sttChain.then(() => transcribe(pcm));
+  sttChain = job.catch(() => {});
+  return job;
 }
 
 async function handleUtterance(frames, identity) {
@@ -176,7 +218,7 @@ async function handleUtterance(frames, identity) {
   let off = 0;
   for (const f of frames) { pcm.set(f, off); off += f.length; }
   try {
-    const heard = (await transcribe(pcm)).trim();
+    const heard = (await transcribeQueued(pcm)).trim();
     if (!heard) return;
     console.log(`[${identity}] heard: ${heard}`);
     if (cfg.llm) {
