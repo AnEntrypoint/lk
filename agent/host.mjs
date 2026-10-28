@@ -41,6 +41,7 @@ const CAPTURE_FRAME_MS = 10;            // small capture frames keep latency low
 const RNN_FRAME = CAPTURE_RATE * CAPTURE_FRAME_MS / 1000; // rnnoise runs on 10 ms at 48 kHz
 const DECIMATE = CAPTURE_RATE / STT_RATE;
 const VAD_THRESHOLD = Number(env.VAD_THRESHOLD ?? 0.6);
+const GATE_DBFS = Number(env.GATE_DBFS ?? -12);  // frames quieter than this never count as speech
 const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 300) / CAPTURE_FRAME_MS;
 const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 6000) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
@@ -175,6 +176,13 @@ function denoiseFrame(state, pcm48) {
   return { vad, pcm16k };
 }
 
+function frameDbfs(pcm16k) {
+  let sum = 0;
+  for (let i = 0; i < pcm16k.length; i++) sum += pcm16k[i] * pcm16k[i];
+  const rms = Math.sqrt(sum / pcm16k.length) / 32768;
+  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+}
+
 // VAD-endpointed segmentation of one remote track. An utterance is sent as soon as
 // speech has been quiet for END_SILENCE_MS, or when it reaches MAX_UTTER_MS.
 async function listen(track, identity) {
@@ -186,15 +194,16 @@ async function listen(track, identity) {
   for await (const frame of stream) {
     if (Date.now() < speakingUntil) { preRoll.length = 0; utter = null; continue; }
     const { vad, pcm16k } = denoiseFrame(state, frame.data);
+    const voiced = vad >= VAD_THRESHOLD && frameDbfs(pcm16k) >= GATE_DBFS;
     if (utter) {
       utter.push(pcm16k);
-      silent = vad >= VAD_THRESHOLD ? 0 : silent + 1;
+      silent = voiced ? 0 : silent + 1;
       if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTER_FRAMES) {
         const done = utter;
         utter = null;
         if (done.length >= MIN_UTTERANCE_FRAMES) handleUtterance(done, identity);
       }
-    } else if (vad >= VAD_THRESHOLD) {
+    } else if (voiced) {
       utter = [...preRoll, pcm16k];
       silent = 0;
     }
