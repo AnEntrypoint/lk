@@ -9,9 +9,9 @@
   "keywords": [],
   "type": "commonjs",
   "dependencies": {
-    "@jitsi/rnnoise-wasm": "^0.2.1",
     "@livekit/agents": "^1.9.4",
     "@livekit/agents-plugin-silero": "^1.9.4",
-    "@livekit/rtc-node": "^1.2.1"
+    "@livekit/rtc-node": "^1.2.1",
+    "sherpa-onnx-node": "^2.0.1"
   }
 }

@@ -17,7 +17,6 @@ import {
   TrackPublishOptions,
   TrackSource,
 } from '@livekit/rtc-node';
-import createRNN from './vendor/rnnoise-sync.mjs';
 
 const env = process.env;
 const cfg = {
@@ -38,14 +37,11 @@ const STT_RATE = 16000;
 const FRAME_MS = 20;
 const CAPTURE_RATE = 48000;
 const CAPTURE_FRAME_MS = 10;            // small capture frames keep latency low
-const RNN_FRAME = CAPTURE_RATE * CAPTURE_FRAME_MS / 1000; // rnnoise runs on 10 ms at 48 kHz
 const DECIMATE = CAPTURE_RATE / STT_RATE;
-const VAD_THRESHOLD = Number(env.VAD_THRESHOLD ?? 0.6);
-const GATE_DBFS = Number(env.GATE_DBFS ?? -16);  // frames quieter than this never count as speech
-const DRC_WINDOW_FRAMES = 60000 / CAPTURE_FRAME_MS; // 60 s moving window of 10 ms frames
-const DRC_TARGET_DBFS = Number(env.DRC_TARGET_DBFS ?? -20);
-const DRC_MAX_BOOST = Number(env.DRC_MAX_BOOST ?? 2); // linear gain ceiling: 2x = +6 dB
-const VAD_CONTINUE = Number(env.VAD_CONTINUE ?? 0.35); // hysteresis: stay in speech through brief dips
+const ENERGY_DBFS = Number(env.ENERGY_DBFS ?? -40);            // raw level that starts an utterance
+const ENERGY_CONTINUE_DBFS = Number(env.ENERGY_CONTINUE_DBFS ?? -46); // hysteresis: stay in speech through dips
+const BARGE_DBFS = Number(env.BARGE_DBFS ?? -30);              // raw level that counts as barge-in during playback
+const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
 const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
 const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 15000) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
@@ -100,12 +96,7 @@ let source;
 const ECHO_TAIL_MS = 800;
 let speakingUntil = 0;
 let playbackId = 0;
-const BARGE_VAD = Number(env.BARGE_VAD ?? 0.6);       // same as the speech-start threshold; BARGE_MS guards against blips
-const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
-let bargeCount = 0;
-let peakVad = 0;
-let peakDb = -Infinity;
-let lastBargeLog = 0;
+       // same as the speech-start threshold; BARGE_MS guards against blips
 
 // Cancels whatever the bot is saying: drops queued audio and stops the speak loop.
 function interruptPlayback() {
@@ -196,85 +187,45 @@ async function askBrain(text, from) {
   return (await res.json()).text ?? '';
 }
 
-// rnnoise denoises each 10 ms frame at 48 kHz, returns its voice-activity probability,
-// and the output is decimated to 16 kHz for STT.
-const rnn = await createRNN();
-const rnnIn = rnn._malloc(RNN_FRAME * 4);
-const rnnOut = rnn._malloc(RNN_FRAME * 4);
-
-function denoiseFrame(state, pcm48) {
-  const base = rnnIn >> 2;
-  for (let i = 0; i < RNN_FRAME; i++) rnn.HEAPF32[base + i] = pcm48[i];
-  const vad = rnn._rnnoise_process_frame(state, rnnOut, rnnIn);
-  const outBase = rnnOut >> 2;
-  const pcm16k = new Int16Array(RNN_FRAME / DECIMATE);
-  for (let i = 0; i < pcm16k.length; i++) {
-    const j = outBase + i * DECIMATE;
+// Raw-path endpointing: no denoise, gain or gate stage. Each 10 ms frame is decimated to
+// 16 kHz for STT and classified by its own level. Hysteresis keeps dips inside a sentence.
+function decimateTo16k(pcm48) {
+  const out = new Int16Array(pcm48.length / DECIMATE);
+  for (let i = 0; i < out.length; i++) {
     let sum = 0;
-    for (let k = 0; k < DECIMATE; k++) sum += rnn.HEAPF32[j + k];
-    pcm16k[i] = Math.max(-32768, Math.min(32767, Math.round(sum / DECIMATE)));
+    for (let k = 0; k < DECIMATE; k++) sum += pcm48[i * DECIMATE + k];
+    out[i] = Math.round(sum / DECIMATE);
   }
-  return { vad, pcm16k };
+  return out;
 }
 
-// Moving-window leveler: tracks mean power over the last 60 s and boosts quiet input toward
-// DRC_TARGET_DBFS, capped at DRC_MAX_BOOST. Gain is smoothed so it does not pump.
-function makeLeveler() {
-  const power = new Float64Array(DRC_WINDOW_FRAMES);
-  let idx = 0;
-  let filled = 0;
+function rawDbfs(pcm48) {
   let sum = 0;
-  let gain = 1;
-  const maxGain = DRC_MAX_BOOST;
-  return (pcm) => {
-    let p = 0;
-    for (let i = 0; i < pcm.length; i++) p += (pcm[i] / 32768) ** 2;
-    p /= pcm.length;
-    sum += p - power[idx];
-    power[idx] = p;
-    idx = (idx + 1) % DRC_WINDOW_FRAMES;
-    if (filled < DRC_WINDOW_FRAMES) filled++;
-    const meanDb = sum > 0 ? 10 * Math.log10(sum / filled) : -120;
-    const want = Math.min(maxGain, 10 ** ((DRC_TARGET_DBFS - meanDb) / 20));
-    gain += (Math.max(1, want) - gain) * 0.05;
-    const out = new Int16Array(pcm.length);
-    for (let i = 0; i < pcm.length; i++) out[i] = Math.max(-32768, Math.min(32767, Math.round(pcm[i] * gain)));
-    return out;
-  };
-}
-
-function frameDbfs(pcm16k) {
-  let sum = 0;
-  for (let i = 0; i < pcm16k.length; i++) sum += pcm16k[i] * pcm16k[i];
-  const rms = Math.sqrt(sum / pcm16k.length) / 32768;
+  for (let i = 0; i < pcm48.length; i++) sum += pcm48[i] * pcm48[i];
+  const rms = Math.sqrt(sum / pcm48.length) / 32768;
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
-// VAD-endpointed segmentation of one remote track. An utterance is sent as soon as
-// speech has been quiet for END_SILENCE_MS, or when it reaches MAX_UTTER_MS.
 async function listen(track, identity) {
   const stream = new AudioStream(track, { sampleRate: CAPTURE_RATE, numChannels: 1, frameSizeMs: CAPTURE_FRAME_MS });
-  const state = rnn._rnnoise_create(0);
-  const level = makeLeveler();
   const preRoll = [];
   let utter = null;
   let silent = 0;
+  let bargeCount = 0;
+  let peakDb = -Infinity;
+  let lastLog = 0;
   for await (const frame of stream) {
-    const { vad, pcm16k: denoised } = denoiseFrame(state, frame.data);
-    const pcm16k = level(denoised);
-    const loud = frameDbfs(pcm16k) >= GATE_DBFS;
+    const pcm16k = decimateTo16k(frame.data);
+    const db = rawDbfs(frame.data);
     if (Date.now() < speakingUntil) {
-      // Bot is talking: only sustained, confident speech counts as a barge-in.
       const now = Date.now();
-      if (now - lastBargeLog >= 1000) {
-        console.log(`[${identity}] during playback: peakVad=${peakVad.toFixed(2)} peakDbfs=${peakDb.toFixed(1)}`);
-        peakVad = 0;
+      if (now - lastLog >= 1000) {
+        console.log(`[${identity}] during playback: peakDbfs=${peakDb.toFixed(1)}`);
         peakDb = -Infinity;
-        lastBargeLog = now;
+        lastLog = now;
       }
-      peakVad = Math.max(peakVad, vad);
-      peakDb = Math.max(peakDb, frameDbfs(pcm16k));
-      bargeCount = loud && vad >= BARGE_VAD ? bargeCount + 1 : 0;
+      peakDb = Math.max(peakDb, db);
+      bargeCount = db >= BARGE_DBFS ? bargeCount + 1 : 0;
       if (bargeCount < BARGE_FRAMES) {
         preRoll.push(pcm16k);
         if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
@@ -284,24 +235,21 @@ async function listen(track, identity) {
       interruptPlayback();
       console.log(`[${identity}] barge-in: playback interrupted`);
     }
-    const voiced = vad >= VAD_THRESHOLD && loud;
     if (utter) {
       utter.push(pcm16k);
-      const continuing = vad >= VAD_CONTINUE && loud;
-      silent = continuing ? 0 : silent + 1;
+      silent = db >= ENERGY_CONTINUE_DBFS ? 0 : silent + 1;
       if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTER_FRAMES) {
         const done = utter;
         utter = null;
         if (done.length >= MIN_UTTERANCE_FRAMES) handleUtterance(done, identity);
       }
-    } else if (voiced) {
+    } else if (db >= ENERGY_DBFS) {
       utter = [...preRoll, pcm16k];
       silent = 0;
     }
     preRoll.push(pcm16k);
     if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
   }
-  rnn._rnnoise_destroy(state);
 }
 
 // Transcriptions run one at a time so utterances are served in order without blocking capture.
