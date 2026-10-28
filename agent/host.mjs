@@ -45,8 +45,9 @@ const GATE_DBFS = Number(env.GATE_DBFS ?? -16);  // frames quieter than this nev
 const DRC_WINDOW_FRAMES = 60000 / CAPTURE_FRAME_MS; // 60 s moving window of 10 ms frames
 const DRC_TARGET_DBFS = Number(env.DRC_TARGET_DBFS ?? -20);
 const DRC_MAX_BOOST = Number(env.DRC_MAX_BOOST ?? 2); // linear gain ceiling: 2x = +6 dB
-const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 300) / CAPTURE_FRAME_MS;
-const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 6000) / CAPTURE_FRAME_MS;
+const VAD_CONTINUE = Number(env.VAD_CONTINUE ?? 0.35); // hysteresis: stay in speech through brief dips
+const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
+const MAX_UTTER_FRAMES = Number(env.MAX_UTTER_MS ?? 15000) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
 const MIN_UTTERANCE_FRAMES = 10;        // 100 ms
 const REPLY_TIMEOUT_MS = Number(env.REPLY_TIMEOUT_MS ?? 120000);
@@ -98,19 +99,53 @@ let source;
 // room's own playback picked up by a browser mic is not transcribed back.
 const ECHO_TAIL_MS = 800;
 let speakingUntil = 0;
+let playbackId = 0;
+const BARGE_VAD = Number(env.BARGE_VAD ?? 0.9);       // stricter than VAD_THRESHOLD so echo does not interrupt
+const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
+let bargeCount = 0;
+
+// Cancels whatever the bot is saying: drops queued audio and stops the speak loop.
+function interruptPlayback() {
+  playbackId++;
+  speakingUntil = 0;
+  source?.clearQueue();
+}
+
+// Sentence-sized pieces so the first words play while the rest is still synthesizing.
+function splitSentences(text) {
+  const parts = text.match(/[^.!?]+[.!?]*/g) ?? [text];
+  return parts.map((s) => s.trim()).filter(Boolean);
+}
+
+async function synthesizeChecked(text) {
+  const { samples, rate } = await synthesize(text);
+  if (rate !== TTS_RATE) throw new Error(`unexpected TTS rate ${rate}`);
+  return samples;
+}
 
 async function speak(text) {
   if (!source) throw new Error('not connected to a room yet');
-  const { samples, rate } = await synthesize(text);
-  if (rate !== TTS_RATE) throw new Error(`unexpected TTS rate ${rate}`);
+  const id = ++playbackId;
   const per = (TTS_RATE * FRAME_MS) / 1000;
-  speakingUntil = Date.now() + (samples.length / TTS_RATE) * 1000 + ECHO_TAIL_MS;
-  for (let i = 0; i < samples.length; i += per) {
-    const chunk = samples.slice(i, i + per);
-    const padded = chunk.length === per ? chunk : Object.assign(new Int16Array(per), chunk);
-    await source.captureFrame(new AudioFrame(padded, TTS_RATE, 1, per));
+  const sentences = splitSentences(text);
+  if (!sentences.length) return;
+  let pending = synthesizeChecked(sentences[0]);
+  for (let s = 0; s < sentences.length; s++) {
+    const samples = await pending;
+    if (s + 1 < sentences.length) {
+      pending = synthesizeChecked(sentences[s + 1]);
+      pending.catch(() => {});
+    }
+    if (id !== playbackId) return;
+    speakingUntil = Math.max(speakingUntil, Date.now()) + (samples.length / TTS_RATE) * 1000;
+    for (let i = 0; i < samples.length; i += per) {
+      if (id !== playbackId) return;
+      const chunk = samples.slice(i, i + per);
+      const padded = chunk.length === per ? chunk : Object.assign(new Int16Array(per), chunk);
+      await source.captureFrame(new AudioFrame(padded, TTS_RATE, 1, per));
+    }
   }
-  speakingUntil = Date.now() + ECHO_TAIL_MS;
+  if (id === playbackId) speakingUntil = Date.now() + ECHO_TAIL_MS;
 }
 
 async function transcribe(samples16k) {
@@ -222,13 +257,26 @@ async function listen(track, identity) {
   let utter = null;
   let silent = 0;
   for await (const frame of stream) {
-    if (Date.now() < speakingUntil) { preRoll.length = 0; utter = null; continue; }
     const { vad, pcm16k: denoised } = denoiseFrame(state, frame.data);
     const pcm16k = level(denoised);
-    const voiced = vad >= VAD_THRESHOLD && frameDbfs(pcm16k) >= GATE_DBFS;
+    const loud = frameDbfs(pcm16k) >= GATE_DBFS;
+    if (Date.now() < speakingUntil) {
+      // Bot is talking: only sustained, confident speech counts as a barge-in.
+      bargeCount = loud && vad >= BARGE_VAD ? bargeCount + 1 : 0;
+      if (bargeCount < BARGE_FRAMES) {
+        preRoll.push(pcm16k);
+        if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
+        continue;
+      }
+      bargeCount = 0;
+      interruptPlayback();
+      console.log(`[${identity}] barge-in: playback interrupted`);
+    }
+    const voiced = vad >= VAD_THRESHOLD && loud;
     if (utter) {
       utter.push(pcm16k);
-      silent = voiced ? 0 : silent + 1;
+      const continuing = vad >= VAD_CONTINUE && loud;
+      silent = continuing ? 0 : silent + 1;
       if (silent >= END_SILENCE_FRAMES || utter.length >= MAX_UTTER_FRAMES) {
         const done = utter;
         utter = null;
