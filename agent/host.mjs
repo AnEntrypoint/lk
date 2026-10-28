@@ -100,7 +100,7 @@ let source;
 const ECHO_TAIL_MS = 800;
 let speakingUntil = 0;
 let playbackId = 0;
-const BARGE_VAD = Number(env.BARGE_VAD ?? 0.9);       // stricter than VAD_THRESHOLD so echo does not interrupt
+const BARGE_VAD = Number(env.BARGE_VAD ?? 0.6);       // same as the speech-start threshold; BARGE_MS guards against blips
 const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
 let bargeCount = 0;
 
