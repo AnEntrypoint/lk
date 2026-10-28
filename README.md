@@ -35,4 +35,6 @@ Endpoints on the host: `GET /health`, `POST /speak {text}`.
 - **Speech → Claude:** the voice host forwards each heard utterance to `INBOX_URL` (default `http://127.0.0.1:7777/messages`) and waits up to `REPLY_TIMEOUT_MS` (120 s) for a reply. The session receives it as a `notifications/message`, or drains it with `read_messages`.
 - **Claude → speech (responder):** the `send_message` tool POSTs `{text, sentAt, source}` to `CCM_WEBHOOK_URL` (`http://127.0.0.1:8800/speak`). `/speak` resolves the pending utterance, so the reply is spoken as that turn's answer; with nothing pending it speaks the text directly.
 
+To receive inbound messages as live channel events, start Claude Code with `claude --dangerously-load-development-channels server:ccm-inbox` (custom channels are not on the approved allowlist). Without the flag the same messages are still available through `read_messages`.
+
 Start `./run.sh` (services and host) before restarting the Claude session so the inbox and webhook are up.
