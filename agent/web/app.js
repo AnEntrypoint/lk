@@ -10,7 +10,9 @@ async function join() {
   setStatus('connecting');
   const identity = `browser-${Math.random().toString(36).slice(2, 7)}`;
   const { url, token } = await (await fetch(`/token?identity=${identity}`)).json();
-  room = new Room();
+  // Browser echo cancellation removes the host's own voice from the mic, so barge-in hears only the user.
+  // Noise suppression and gain stay off: the host runs rnnoise and its own leveler.
+  room = new Room({ audioCaptureDefaults: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
   room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
     if (track.kind !== Track.Kind.Audio) return;
     const el = track.attach();
