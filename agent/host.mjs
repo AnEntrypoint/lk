@@ -42,6 +42,7 @@ const ENERGY_DBFS = Number(env.ENERGY_DBFS ?? -40);            // raw level that
 const ENERGY_CONTINUE_DBFS = Number(env.ENERGY_CONTINUE_DBFS ?? -46); // hysteresis: stay in speech through dips
 const BARGE_DBFS = Number(env.BARGE_DBFS ?? -30);              // raw level that counts as barge-in during playback
 const BARGE_FRAMES = Number(env.BARGE_MS ?? 250) / CAPTURE_FRAME_MS;
+const MIN_SPEECH_FRAMES = Number(env.MIN_SPEECH_MS ?? 250) / CAPTURE_FRAME_MS; // drops clicks and cup knocks
 const END_SILENCE_FRAMES = Number(env.END_SILENCE_MS ?? 800) / CAPTURE_FRAME_MS;
 const PRE_ROLL_FRAMES = 20;             // 200 ms kept before speech onset
 const MIN_UTTERANCE_FRAMES = 10;        // 100 ms
@@ -240,6 +241,7 @@ async function listen(track, identity) {
   const preRoll = [];
   let utter = null;
   let silent = 0;
+  let voiced = 0;
   let bargeCount = 0;
   let peakDb = -Infinity;
   let lastLog = 0;
@@ -267,14 +269,18 @@ async function listen(track, identity) {
     if (utter) {
       utter.push(pcm16k);
       silent = db >= ENERGY_CONTINUE_DBFS ? 0 : silent + 1;
+      if (db >= ENERGY_DBFS) voiced++;
       if (silent >= END_SILENCE_FRAMES) {
         const done = utter;
         utter = null;
-        if (done.length >= MIN_UTTERANCE_FRAMES) handleUtterance(done, identity);
+        if (voiced >= MIN_SPEECH_FRAMES) handleUtterance(done, identity);
+        else console.log(`[${identity}] dropped short burst (${voiced} voiced frames)`);
+        voiced = 0;
       }
     } else if (db >= ENERGY_DBFS) {
       utter = [...preRoll, pcm16k];
       silent = 0;
+      voiced = 1;
     }
     preRoll.push(pcm16k);
     if (preRoll.length > PRE_ROLL_FRAMES) preRoll.shift();
