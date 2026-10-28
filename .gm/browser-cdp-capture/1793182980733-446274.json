@@ -1,0 +1,27 @@
+{
+  "console_events": [
+    {
+      "msgid": 1,
+      "level": "error",
+      "kind": "log",
+      "text": "Failed to load resource: the server responded with a status of 404 (Not Found)",
+      "url": "http://127.0.0.1:8801/favicon.ico",
+      "line": null,
+      "column": null,
+      "timestamp": 1793182978715.554,
+      "source": "network"
+    }
+  ],
+  "network_requests": 9,
+  "network_failures": [
+    {
+      "reqid": 9,
+      "method": "GET",
+      "url": "http://127.0.0.1:8801/favicon.ico",
+      "type": "Other",
+      "status": 404,
+      "failed": null
+    }
+  ],
+  "capture_faults": []
+}

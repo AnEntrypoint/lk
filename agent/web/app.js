@@ -20,9 +20,13 @@ async function join() {
   });
   room.on(RoomEvent.Disconnected, () => { setStatus('disconnected'); $('join').disabled = false; $('leave').disabled = true; });
   await room.connect(url, token);
-  await room.localParticipant.setMicrophoneEnabled(true);
   $('leave').disabled = false;
-  setStatus(`connected as ${identity}`);
+  try {
+    await room.localParticipant.setMicrophoneEnabled(true);
+    setStatus(`connected as ${identity}, mic on`);
+  } catch {
+    setStatus(`connected as ${identity}, no mic (listen only)`);
+  }
 }
 
 async function leave() {

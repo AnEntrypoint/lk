@@ -1,0 +1,9 @@
+evt: {"changed":["/workspace/lk/.gm/config-source-cache-default/gm.config.json"],"changed_count":1,"event":"config_changed","id":"cfg-implicit_default_repo-aa1c52614411-1793182972044","new_sha":"aa1c52614411","old_sha":"","sess":"mcp-codemode-441754-1793182965739-3","tier":"implicit_default_repo","ts":1793182972062}
+evt: {"event":"config_resolved","sess":"mcp-codemode-441754-1793182965739-3","tier":"implicit_default_repo","ts":1793182972155,"version":1,"why":"gm's own shared default config repo at https://github.com/AnEntrypoint/gm-config (no project or user config.source.json configured)"}
+evt: {"event":"dispatch.end","ms":3791,"sess":"mcp-codemode-441754-1793182965739-3","ts":1793182972176,"verb":"phase-status"}
+evt: {"event":"dispatch.end","ms":23,"sess":"mcp-codemode-441754-1793182965739-3","ts":1793182972425,"verb":"browser"}
+evt: {"event":"dispatch.end","ms":14,"sess":"mcp-codemode-441754-1793182976701-4","ts":1793182976781,"verb":"phase-status"}
+evt: {"event":"dispatch.end","ms":3790,"sess":"mcp-codemode-441754-1793182976701-4","ts":1793182980760,"verb":"browser"}
+evt: {"event":"dispatch.end","ms":122,"sess":"mcp-codemode-441754-1793182983529-5","ts":1793182983706,"verb":"browser"}
+evt: {"event":"dispatch.end","ms":5146,"sess":"mcp-codemode-441754-1793182987495-6","ts":1793182992691,"verb":"browser"}
+evt: {"event":"dispatch.end","ms":8286,"sess":"mcp-codemode-441754-1793183001564-7","ts":1793183009916,"verb":"browser"}
