@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start the voice stack and page server if they are down, then launch Claude Code
 # with the ccm-inbox channel flag so inbound speech arrives as live channel events.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"  # /dev/tcp port checks need bash, not sh/dash
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
