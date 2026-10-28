@@ -32,7 +32,7 @@ Endpoints on the host: `GET /health`, `POST /speak {text}`.
 
 `.mcp.json` registers `ccm-inbox` from GitHub via `npx -y github:AnEntrypoint/ccm`. Claude Code launches it per session; it serves the HTTP inbox on `127.0.0.1:7777`.
 
-- **Speech → Claude:** the voice host forwards each heard utterance to `INBOX_URL` (default `http://127.0.0.1:7777/messages`). The session receives it as a `notifications/message`, or drains it with `read_messages`.
-- **Claude → speech:** the `send_message` tool POSTs `{text, sentAt, source}` to `CCM_WEBHOOK_URL` (`http://127.0.0.1:8800/speak`), which speaks it in the room.
+- **Speech → Claude:** the voice host forwards each heard utterance to `INBOX_URL` (default `http://127.0.0.1:7777/messages`) and waits up to `REPLY_TIMEOUT_MS` (120 s) for a reply. The session receives it as a `notifications/message`, or drains it with `read_messages`.
+- **Claude → speech (responder):** the `send_message` tool POSTs `{text, sentAt, source}` to `CCM_WEBHOOK_URL` (`http://127.0.0.1:8800/speak`). `/speak` resolves the pending utterance, so the reply is spoken as that turn's answer; with nothing pending it speaks the text directly.
 
 Start `./run.sh` (services and host) before restarting the Claude session so the inbox and webhook are up.

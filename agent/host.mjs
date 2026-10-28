@@ -1,8 +1,8 @@
 // LiveKit voice host (Node). Audio work is delegated to native C++ services:
 //   Paradee TTS  (native/build/paradee_server)  POST /tts  -> WAV 24 kHz
 //   Underdog STT (starling-serve, parakeet)     POST /v1/audio/transcriptions -> JSON {text}
-// Outbound: heard speech goes to the ccm inbox (INBOX_URL) for the MCP session to answer,
-//   or to LLM_URL (POST {text} -> {text}) when set. Replies come back via POST /speak.
+// Outbound: heard speech goes to the ccm inbox (INBOX_URL); the session answers via ccm send_message,
+//   which posts the reply to POST /speak and the host speaks it. LLM_URL (POST {text} -> {text}) overrides.
 // Inbound HTTP:   POST /speak {text} makes the bot say it in the room.
 import http from 'node:http';
 import { AccessToken } from 'livekit-server-sdk';
@@ -38,6 +38,7 @@ const FRAME_MS = 20;
 const SILENCE_RMS = 500;   // int16 RMS below this counts as silence
 const SILENCE_FRAMES = 25; // 0.5 s of silence ends an utterance
 const MIN_UTTERANCE_FRAMES = 10;
+const REPLY_TIMEOUT_MS = Number(env.REPLY_TIMEOUT_MS ?? 120000);
 
 function token() {
   const at = new AccessToken(cfg.key, cfg.secret, { identity: cfg.identity });
@@ -114,6 +115,21 @@ async function forwardToInbox(text, from) {
   if (!res.ok) throw new Error(`inbox ${res.status}`);
 }
 
+// Replies that arrive on POST /speak while an utterance is waiting resolve that wait
+// (FIFO). Used for the MCP round trip: inbox forward -> session send_message -> /speak.
+const waiters = [];
+function awaitReply() {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const i = waiters.indexOf(done);
+      if (i >= 0) waiters.splice(i, 1);
+      resolve('');
+    }, REPLY_TIMEOUT_MS);
+    const done = (text) => { clearTimeout(timer); resolve(text); };
+    waiters.push(done);
+  });
+}
+
 async function askBrain(text, from) {
   if (!cfg.llm) return `You said: ${text}`;
   const res = await fetch(cfg.llm, {
@@ -168,6 +184,9 @@ async function handleUtterance(frames, identity) {
       if (reply) await speak(reply);
     } else {
       await forwardToInbox(heard, identity);
+      const reply = (await awaitReply()).trim();
+      if (!reply) console.log(`[${identity}] no reply within ${REPLY_TIMEOUT_MS} ms`);
+      else { console.log(`[${identity}] reply: ${reply}`); await speak(reply); }
     }
   } catch (err) {
     console.error('utterance failed:', err.message);
@@ -196,6 +215,12 @@ async function main() {
       try {
         const { text } = JSON.parse(body || '{}');
         if (!text) { res.statusCode = 400; return res.end('{"error":"text required"}'); }
+        if (waiters.length) {
+          console.log(`reply resolved pending utterance: ${text}`);
+          waiters.shift()(text);
+          return res.end('{"ok":true,"reply":true}');
+        }
+        console.log(`speak (no pending utterance): ${text}`);
         await speak(text);
         return res.end('{"ok":true}');
       } catch (err) {
